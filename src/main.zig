@@ -4,11 +4,23 @@ const SKIP_OUTLIERS        = true;
 const RUN_LEGACY_TOKENIZER = true;
 const RUN_NEW_TOKENIZER    = true;
 const RUN_COMPRESS_TOKENIZER = true;
+const RUN_COMPRESS_512_TOKENIZER = true;
+const VERIFY_AGAINST_STD   = true;
+/// Also time each tokenizer writing into output buffers that are already allocated and paged in, best of this many passes.
+const WARM_PASSES          = 21;
 const RUN_LEGACY_AST       = false;
 const RUN_NEW_AST          = false;
 const REPORT_SPEED         = true;
 const INFIX_TEST           = false;
 // zig fmt: on
+
+/// The 512-byte-chunk version of the compressing tokenizer (see the file for its origin).
+const CompactingTokenizer = @import("CompactingTokenizer.zig");
+const std_tokenizer_check = @import("std_tokenizer_check.zig");
+
+test {
+    _ = std_tokenizer_check;
+}
 
 // const rpmalloc = @import("rpmalloc");
 // const zimalloc = @import("zimalloc");
@@ -2706,6 +2718,103 @@ fn compressq(compressable: @Vector(8, u64), mask: u8) @Vector(8, u64) {
     }.@"llvm.x86.avx512.mask.compress.q"(compressable, @splat(0), mask);
 }
 
+/// The (64-byte) compression tokenizer emits `len`/`kind` pairs and leaves whitespace out, so this recovers each
+/// token's `[start, end)` by skipping the whitespace in between.
+fn spansOfCompressTokens(
+    comptime Tokenize: type,
+    gpa: Allocator,
+    source: []const u8,
+    tokens: []const Tokenize.Token,
+    spans: *std.ArrayListUnmanaged(std_tokenizer_check.Token),
+) !void {
+    var cursor: u32 = 0;
+    var i: usize = 0;
+    while (i < tokens.len and tokens[i].kind != .eof) {
+        while (cursor < source.len and std.mem.indexOfScalar(u8, " \t\n\r", source[cursor]) != null) cursor += 1;
+        const is_large_token = tokens[i].len == 0;
+        const len: u32 = if (is_large_token) @bitCast(tokens[i + 1 ..][0..2].*) else tokens[i].len;
+        try spans.append(gpa, .{
+            .kind = tagName(Tokenize.Tag, @intFromEnum(tokens[i].kind)),
+            .start = cursor,
+            .end = cursor + len,
+        });
+        cursor += len;
+        i += if (is_large_token) 3 else 1;
+    }
+}
+
+/// `@tagName`, but safe to call on a value that isn't a valid tag.
+fn tagName(comptime T: type, value: @typeInfo(T).@"enum".tag_type) []const u8 {
+    const tag = std.meta.intToEnum(T, value) catch return "<invalid kind>";
+    return @tagName(tag);
+}
+
+/// Counts this thread's user-space CPU cycles and instructions (Linux only), alongside wall time.
+const PerfCounters = struct {
+    cycles_fd: ?std.posix.fd_t,
+    instructions_fd: ?std.posix.fd_t,
+
+    const Sample = struct {
+        ns: u64,
+        cycles: u64,
+        instructions: u64,
+
+        fn since(self: Sample, before: Sample) Sample {
+            return .{ .ns = self.ns - before.ns, .cycles = self.cycles - before.cycles, .instructions = self.instructions - before.instructions };
+        }
+    };
+
+    fn open() PerfCounters {
+        return .{ .cycles_fd = openCounter(.CPU_CYCLES), .instructions_fd = openCounter(.INSTRUCTIONS) };
+    }
+
+    fn openCounter(counter: std.os.linux.PERF.COUNT.HW) ?std.posix.fd_t {
+        if (builtin.os.tag != .linux) return null;
+        var attr: std.os.linux.perf_event_attr = .{ .type = .HARDWARE, .config = @intFromEnum(counter) };
+        attr.flags.exclude_kernel = true;
+        attr.flags.exclude_hv = true;
+        const rc = std.os.linux.perf_event_open(&attr, 0, -1, -1, std.os.linux.PERF.FLAG.FD_CLOEXEC);
+        if (std.os.linux.E.init(rc) != .SUCCESS) return null;
+        return @intCast(rc);
+    }
+
+    fn read(fd: ?std.posix.fd_t) u64 {
+        var value: u64 = 0;
+        if (fd) |f| _ = std.posix.read(f, std.mem.asBytes(&value)) catch {};
+        return value;
+    }
+
+    fn now(self: PerfCounters) Sample {
+        return .{
+            .cycles = read(self.cycles_fd),
+            .instructions = read(self.instructions_fd),
+            .ns = @intCast(std.time.nanoTimestamp()),
+        };
+    }
+
+    /// Which CPUs this process may run on, so the output says whether it was pinned.
+    const Affinity = struct {
+        set: std.posix.cpu_set_t,
+
+        fn get() Affinity {
+            return .{ .set = std.posix.sched_getaffinity(0) catch std.mem.zeroes(std.posix.cpu_set_t) };
+        }
+
+        pub fn format(self: Affinity, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            var count: usize = 0;
+            var only: usize = 0;
+            for (self.set, 0..) |word, i| {
+                count += @popCount(word);
+                if (word != 0) only = i * @bitSizeOf(usize) + @ctz(word);
+            }
+            if (count == 1)
+                try writer.print("pinned to CPU {}", .{only})
+            else
+                try writer.print("not pinned: {} CPUs allowed", .{count});
+        }
+    };
+};
+
 // const Rp = rpmalloc.RPMalloc(.{});
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
@@ -2898,6 +3007,159 @@ pub fn main() !void {
                 try stdout.print("       That's {d:.2}x faster and {d:.2}x less memory than the mainline implementation!\n", .{ @as(f64, @floatFromInt(elapsedNanos2)) / @as(f64, @floatFromInt(elapsedNanos3)), @as(f64, @floatFromInt(num_tokens2 * 5)) / @as(f64, @floatFromInt(num_tokens * 2)) });
             }
             // try stdout.print("       That's {d:.2}x faster than my old implementation!\n", .{@as(f64, @floatFromInt(elapsedNanos)) / @as(f64, @floatFromInt(elapsedNanos3))});
+        }
+
+        const tokenizers_512: []CompactingTokenizer = if (RUN_COMPRESS_512_TOKENIZER)
+            try gpa.alloc(CompactingTokenizer, sources.source_list.len)
+        else
+            &.{};
+        @memset(tokenizers_512, CompactingTokenizer.empty);
+
+        if (RUN_COMPRESS_512_TOKENIZER) {
+            const t4 = std.time.nanoTimestamp();
+            for (
+                sources.source_list.items(.file_contents),
+                sources.source_list.items(.path),
+                tokenizers_512,
+            ) |source, path, *tokenizer| {
+                tokenizer.tokenize(gpa, @ptrCast(source.slice())) catch |e| {
+                    std.debug.print("{s}\n", .{path});
+                    return e;
+                };
+            }
+            const t5 = std.time.nanoTimestamp();
+            const elapsedNanos5: u64 = @intCast(t5 - t4);
+
+            var num_tokens_512: usize = 0;
+            for (tokenizers_512) |tokenizer|
+                num_tokens_512 += tokenizer.token_list.len;
+
+            if (REPORT_SPEED) {
+                const throughput = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos5));
+                const bytes_per_token = @sizeOf(CompactingTokenizer.Tag) + 2 * @sizeOf(u32);
+                try stdout.print("Tokenizing with 512-byte compression took {: >9} ({d:.2} GB/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos5), throughput, std.fmt.fmtIntSizeDec(num_tokens_512 * bytes_per_token) });
+                if (RUN_COMPRESS_TOKENIZER)
+                    try stdout.print("       That's {d:.2}x the speed of the 64-byte compression tokenizer.\n", .{@as(f64, @floatFromInt(elapsedNanos3)) / @as(f64, @floatFromInt(elapsedNanos5))});
+            }
+        }
+
+        if (VERIFY_AGAINST_STD) {
+            var report_64: std_tokenizer_check.Report = .{};
+            var report_512: std_tokenizer_check.Report = .{};
+            var spans: std.ArrayListUnmanaged(std_tokenizer_check.Token) = .empty;
+            defer spans.deinit(gpa);
+
+            for (sources.source_list.items(.file_contents), sources.source_list.items(.path), 0..) |file_contents, path, i| {
+                const source: [:0]const u8 = @ptrCast(file_contents.slice());
+
+                if (RUN_COMPRESS_TOKENIZER) {
+                    spans.clearRetainingCapacity();
+                    try spansOfCompressTokens(Tokenize, gpa, source, source_tokens2.slice()[i], &spans);
+                    std_tokenizer_check.check(source, spans.items, path, &report_64, 10);
+                }
+
+                if (RUN_COMPRESS_512_TOKENIZER) {
+                    spans.clearRetainingCapacity();
+                    const tokens = tokenizers_512[i].token_list.slice();
+                    try spans.ensureTotalCapacity(gpa, tokens.len);
+                    for (tokens.items(.kind), tokens.items(.start), tokens.items(.end)) |kind, start, end| {
+                        spans.appendAssumeCapacity(.{
+                            .kind = tagName(CompactingTokenizer.Tag, @intFromEnum(kind)),
+                            .start = start,
+                            .end = end,
+                        });
+                    }
+                    std_tokenizer_check.check(source, spans.items, path, &report_512, 10);
+                }
+            }
+
+            if (RUN_COMPRESS_TOKENIZER) report_64.print("64-byte compression tokenizer");
+            if (RUN_COMPRESS_512_TOKENIZER) report_512.print("512-byte compression tokenizer");
+        }
+
+        // The timings above include allocating each file's output and paging it in, which the 512-byte tokenizer's
+        // 9-byte tokens make much more expensive. Here each tokenizer writes into an output buffer that is reused across
+        // files, and the tokenizers take turns within each pass so that they all see the same conditions. Besides wall
+        // time we count user-space CPU cycles, which don't depend on the clock frequency.
+        if (WARM_PASSES > 0 and REPORT_SPEED) {
+            var max_len: usize = 0;
+            for (sources.source_list.items(.file_contents)) |file_contents| max_len = @max(max_len, file_contents.len);
+
+            var legacy_tokens: Ast.TokenList = .empty;
+            defer legacy_tokens.deinit(gpa);
+            try legacy_tokens.ensureTotalCapacity(gpa, max_len + 1);
+
+            const compress_buffer = try gpa.alignedAlloc(u8, 64, (max_len + 64 + 3) * @sizeOf(Token));
+            defer gpa.free(compress_buffer);
+            var fba: std.heap.FixedBufferAllocator = .init(compress_buffer);
+
+            var tokenizer_512: CompactingTokenizer = .empty;
+            defer tokenizer_512.deinit(gpa);
+            try tokenizer_512.ensureTokenCapacity(gpa, max_len);
+
+            const counters: PerfCounters = .open();
+            const names = [_][]const u8{ "Legacy tokenizing", "Tokenizing with compression", "Tokenizing with 512-byte compr." };
+            const enabled = [_]bool{ RUN_LEGACY_TOKENIZER, RUN_COMPRESS_TOKENIZER, RUN_COMPRESS_512_TOKENIZER };
+            var samples: [names.len][WARM_PASSES]PerfCounters.Sample = undefined;
+
+            // The first pass isn't recorded: it pages in the output buffers and warms up the caches and branch predictors.
+            for (0..WARM_PASSES + 1) |pass| {
+                inline for (0..names.len) |which| {
+                    if (enabled[which]) {
+                        const before = counters.now();
+                        for (sources.source_list.items(.file_contents)) |file_contents| {
+                            switch (which) {
+                                0 => {
+                                    var tokenizer: std.zig.Tokenizer = .init(@ptrCast(file_contents.slice()));
+                                    legacy_tokens.clearRetainingCapacity();
+                                    while (true) {
+                                        const token = tokenizer.next();
+                                        legacy_tokens.appendAssumeCapacity(.{ .tag = token.tag, .start = @intCast(token.loc.start) });
+                                        if (token.tag == .eof) break;
+                                    }
+                                },
+                                1 => {
+                                    fba.reset();
+                                    _ = try Tokenize.tokenize(fba.allocator(), file_contents.slice());
+                                },
+                                2 => try tokenizer_512.tokenizeAssumeCapacity(@ptrCast(file_contents.slice())),
+                                else => unreachable,
+                            }
+                        }
+                        if (pass > 0) samples[which][pass - 1] = counters.now().since(before);
+                    }
+                }
+            }
+
+            try stdout.print("\nWith output buffers reused across files ({} interleaved passes, {}; medians, cycles/B also min-max):\n", .{ WARM_PASSES, PerfCounters.Affinity.get() });
+            inline for (names, enabled, &samples) |name, is_enabled, *tokenizer_samples| {
+                if (is_enabled) {
+                    var ns: [WARM_PASSES]u64 = undefined;
+                    var cycles: [WARM_PASSES]u64 = undefined;
+                    var instructions: [WARM_PASSES]u64 = undefined;
+                    for (tokenizer_samples, &ns, &cycles, &instructions) |sample, *n, *c, *i| {
+                        n.* = sample.ns;
+                        c.* = sample.cycles;
+                        i.* = sample.instructions;
+                    }
+                    inline for (.{ &ns, &cycles, &instructions }) |values| std.mem.sort(u64, values, {}, std.sort.asc(u64));
+                    const median_ns = ns[WARM_PASSES / 2];
+                    const b: f64 = @floatFromInt(bytes);
+
+                    try stdout.print("  {s: <32} {: >9} ({d:.2} GB/s)", .{ name, std.fmt.fmtDuration(median_ns), b / @as(f64, @floatFromInt(median_ns)) });
+                    if (counters.cycles_fd != null and counters.instructions_fd != null) {
+                        const median_cycles: f64 = @floatFromInt(cycles[WARM_PASSES / 2]);
+                        try stdout.print("  {d:.3} cycles/B [{d:.3}-{d:.3}]  {d:.2} instructions/B  IPC {d:.2}  {d:.2} GHz\n", .{
+                            median_cycles / b,
+                            @as(f64, @floatFromInt(cycles[0])) / b,
+                            @as(f64, @floatFromInt(cycles[WARM_PASSES - 1])) / b,
+                            @as(f64, @floatFromInt(instructions[WARM_PASSES / 2])) / b,
+                            @as(f64, @floatFromInt(instructions[WARM_PASSES / 2])) / median_cycles,
+                            median_cycles / @as(f64, @floatFromInt(median_ns)),
+                        });
+                    } else try stdout.print("  (no perf counters)\n", .{});
+                }
+            }
         }
 
         _ = try std.zig.Ast.parse(gpa, "comptime { a.b.c.*(i()); }", .zig);

@@ -37,7 +37,8 @@ CHANNELS = {
 OPERATOR_CLASSES = {}
 SLOTS = [
     # characters, first-of channels, second-of channels, third-of channels
-    ("*/^!", "EQ", "", ""),
+    ("/^!", "EQ", "", ""),
+    ("*", "EQ", "", ""),
     ("&|", "EQ SELF", "SELF", ""),
     ("+", "EQ SELF", "SELF EXPSIGN", ""),
     ("-", "EQ SELF GT", "SELF EXPSIGN", ""),
@@ -62,6 +63,12 @@ for slot, (characters, first_of, second_of, third_of) in enumerate(SLOTS, start=
         OPERATOR_CLASSES[c] = slot | (i << 4)
     first[slot], second[slot], third[slot] = channel_set(first_of), channel_set(second_of), channel_set(third_of)
 
+# C++ adds "<=>" and "->*": a '>' after a pair in the EQ channel and a '*' after one in the GT channel are triple
+# candidates, which the tokenizer keeps if they start with '<' and '-'. (".*" is found from the '.' and '*' masks.)
+third_cxx = list(third)
+third_cxx[OPERATOR_CLASSES[">"] & 15] |= CHANNELS["EQ"]
+third_cxx[OPERATOR_CLASSES["*"] & 15] |= CHANNELS["GT"]
+
 ONE_CHARACTER = {
     "[": "L_SQUARE", "]": "R_SQUARE", "(": "L_PAREN", ")": "R_PAREN", "{": "L_BRACE", "}": "R_BRACE", ".": "PERIOD",
     "&": "AMP", "*": "STAR", "+": "PLUS", "-": "MINUS", "~": "TILDE", "!": "EXCLAIM", "/": "SLASH", "%": "PERCENT",
@@ -76,6 +83,7 @@ MULTI_CHARACTER = {
     ":>": "R_SQUARE", "<%": "L_BRACE", "%>": "R_BRACE", "%:": "HASH", "...": "ELLIPSIS", "<<=": "LESSLESSEQUAL",
     ">>=": "GREATERGREATEREQUAL", "%:%:": "HASHHASH",
 }
+MULTI_CHARACTER_CXX = {"<=>": "SPACESHIP", "->*": "ARROWSTAR", ".*": "PERIODSTAR"}
 
 
 def is_pair(a, b):
@@ -97,17 +105,31 @@ for a in map(chr, range(33, 127)):
         for c in map(chr, range(33, 127)):
             triple = third[OPERATOR_CLASSES.get(c, 0) & 15] & channels
             assert bool(triple) == (a + b + c in ("<<=", ">>=", "...")), a + b + c
+            triple_cxx = third_cxx[OPERATOR_CLASSES.get(c, 0) & 15] & channels
+            assert bool(triple_cxx & ~(CHANNELS["EQ"] | CHANNELS["GT"])) == bool(triple), a + b + c
+            kept = bool(triple_cxx & (CHANNELS["EQ"] | CHANNELS["GT"])) and a == ("<" if c == ">" else "-")
+            assert kept == (a + b + c in ("<=>", "->*")), a + b + c
 
 # A punctuator's kind is looked up by a perfect hash of its first three characters (the third is 0 for 2-character
 # punctuators, and "%:%" stands for "%:%:").
-HASH_MULTIPLIER = 0x5DCA45B
-op_kinds = [KIND["UNKNOWN"]] * 64
-for op, kind in MULTI_CHARACTER.items():
+def hash_value(op):
     b = op.encode()[:3]
-    value = b[0] | b[1] << 8 | (b[2] << 16 if len(b) > 2 else 0)
-    h = ((value * HASH_MULTIPLIER) & 0xFFFFFFFF) >> 26
-    assert op_kinds[h] == KIND["UNKNOWN"], op
-    op_kinds[h] = KIND[kind]
+    return b[0] | b[1] << 8 | (b[2] << 16 if len(b) > 2 else 0)
+
+
+def op_hash(op, multiplier):
+    return ((hash_value(op) * multiplier) & 0xFFFFFFFF) >> 26
+
+
+ALL_MULTI_CHARACTER = {**MULTI_CHARACTER, **MULTI_CHARACTER_CXX}
+HASH_MULTIPLIER = 0x5DCA45B
+random_state = 1
+while len({op_hash(op, HASH_MULTIPLIER) for op in ALL_MULTI_CHARACTER}) != len(ALL_MULTI_CHARACTER):
+    random_state = (random_state * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+    HASH_MULTIPLIER = (random_state >> 32) | 1
+op_kinds = [KIND["UNKNOWN"]] * 64
+for op, kind in ALL_MULTI_CHARACTER.items():
+    op_kinds[op_hash(op, HASH_MULTIPLIER)] = KIND[kind]
 
 properties, operator_classes, char_kinds = [0] * 128, [0] * 128, [KIND["UNKNOWN"]] * 128
 for i in range(128):
@@ -147,5 +169,6 @@ with open("c/c_tokenizer_tables.h", "w") as out:
     out.write("// Indexed by ASCII character.\n")
     out.write(table("c_char_properties", properties) + "\n" + table("c_operator_classes", operator_classes) + "\n" + table("c_char_kinds", char_kinds) + "\n\n")
     out.write("// Indexed by the low 4 bits of an operator class.\n")
-    out.write(table("c_first_char_channels", first) + "\n" + table("c_second_char_channels", second) + "\n" + table("c_third_char_channels", third) + "\n\n")
+    out.write(table("c_first_char_channels", first) + "\n" + table("c_second_char_channels", second) + "\n" + table("c_third_char_channels", third) + "\n")
+    out.write("// In C++.\n" + table("c_third_char_channels_cxx", third_cxx) + "\n\n")
     out.write("// Indexed by the hash of a multi-character punctuator.\n" + table("c_op_hash_kinds", op_kinds) + "\n")

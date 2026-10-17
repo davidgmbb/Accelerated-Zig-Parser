@@ -7,13 +7,17 @@
 // Phase I runs a chunk ahead, and also classifies the first vector after the chunk, so that Phase II can look ahead:
 // a token that crosses into the next chunk gets its start and kind from this chunk, and its end from the next one.
 //
-// A few rare inputs aren't modeled by the bitstrings, and make the tokenizer start over with the scalar lexer
-// (`c_tokenize_scalar`): a line splice between characters that could make one token (outside of literals and line
-// comments), a splice after a backslash or apostrophe or with whitespace before its newline, a non-ASCII byte or UCN
-// outside of literals and comments (a UTF-8 identifier or a stray character), a stray backslash before a quote or
-// backslash, the overlapping comment delimiters "/*/" and "*/*", an unterminated block comment, block comments whose
-// lines need more than a few rescans to settle, and trigraphs (when enabled). That's under 1% of the bytes of the
-// C corpora it was tested on.
+// A few rare inputs aren't modeled by the bitstrings, and make the vectorized path hand the chunk they're in to the
+// scalar lexer (`c_tokenize_scalar_range`), from the start of the line before it to the first line that starts after
+// it, where the vectorized path resumes: a line splice between characters that could make one token (outside of
+// literals and line comments), a splice after a backslash or apostrophe or with whitespace before its newline, a
+// non-ASCII byte or UCN outside of literals and comments (a UTF-8 identifier or a stray character), a stray
+// backslash before a quote or backslash, the overlapping comment delimiters "/*/" and "*/*", an unterminated block
+// comment, block comments whose lines need more than a few rescans to settle, C++'s raw string literals, and
+// trigraphs (when enabled, for the whole source).
+//
+// C++ (C_TOKENIZER_CPLUSPLUS) is a specialization of the same chunk loop: it adds "<=>", "->*" and ".*", the "<::"
+// rule and user-defined literal suffixes.
 #include "c_tokenizer.h"
 
 #if !defined(__clang__)
@@ -118,6 +122,14 @@ INLINE uint64_t bit_511(u64x8 x)
     return x[7] >> 63;
 }
 
+// The bits below `limit` (at most 512).
+INLINE u64x8 bits_below(uint32_t limit)
+{
+    const __m512i lane_starts = _mm512_setr_epi64(0, 64, 128, 192, 256, 320, 384, 448);
+    const __m512i shifts = _mm512_max_epi64(_mm512_sub_epi64(_mm512_set1_epi64(limit), lane_starts), _mm512_setzero_si512());
+    return (u64x8)_mm512_andnot_si512(_mm512_sllv_epi64(_mm512_set1_epi64(-1), shifts), _mm512_set1_epi64(-1));
+}
+
 // The position of the highest set bit below `limit` (at most 512), or -1 if there is none.
 static int32_t highest_bit_below(u64x8 x, uint32_t limit)
 {
@@ -197,7 +209,7 @@ INLINE __m128i punctuator_kinds(__m512i current, __m512i next, __m128i start_ind
 
 // Could the characters before and after a line splice be part of the same token (outside of literals and comments)?
 // `earlier` is the character before `before`.
-static bool splice_joins(uint8_t earlier, uint8_t before, uint8_t after)
+static bool splice_joins(uint8_t earlier, uint8_t before, uint8_t after, bool cplusplus)
 {
     const bool before_identifier = before >= 0x80 || (c_char_properties[before] & CHAR_IDENTIFIER);
     const bool after_identifier = after >= 0x80 || (c_char_properties[after] & CHAR_IDENTIFIER);
@@ -218,6 +230,11 @@ static bool splice_joins(uint8_t earlier, uint8_t before, uint8_t after)
     {
         result = true; // The sign of an exponent, in a pp-number that goes on.
     }
+    else if (cplusplus && (before == '"' || (before == '.' && after == '*') || (before == '>' && earlier == '-' && after == '*') ||
+                           (before == '=' && earlier == '<' && after == '>')))
+    {
+        result = before != '"' || after_identifier; // ".*", "->*" and "<=>", or a literal's user-defined suffix.
+    }
     else if (before == '.')
     {
         result = after == '.' || after_identifier || after == '\''; // An ellipsis, or a pp-number.
@@ -233,6 +250,55 @@ static bool splice_joins(uint8_t earlier, uint8_t before, uint8_t after)
             channels &= (uint8_t)~SAME_CHARACTER_CHANNELS;
         }
         result = (before < 0x80 && channels != 0) || (before == '/' && (after == '/' || after == '*')) || (before == ':' && after == '%');
+    }
+    return result;
+}
+
+// The byte at `position` of the source, or a newline outside of [`begin`, `length`).
+INLINE uint8_t source_byte(const uint8_t* source, uint64_t begin, uint64_t length, int64_t position)
+{
+    return position >= (int64_t)begin && position < (int64_t)length ? source[position] : '\n';
+}
+
+INLINE bool is_identifier_byte(uint8_t c)
+{
+    return c >= 0x80 || (c_char_properties[c] & CHAR_IDENTIFIER);
+}
+
+// In C++, does the quote at `position` start a raw string literal (it ends an identifier R, LR, u8R, uR or UR)?
+static bool is_raw_string_quote(const uint8_t* source, uint64_t begin, uint64_t length, int64_t position)
+{
+    bool result = false;
+    if (source_byte(source, begin, length, position - 1) == 'R')
+    {
+        const uint8_t before = source_byte(source, begin, length, position - 2);
+        const uint8_t earlier = source_byte(source, begin, length, position - 3);
+        result = !is_identifier_byte(before) || ((before == 'L' || before == 'u' || before == 'U') && !is_identifier_byte(earlier)) ||
+                 (before == '8' && earlier == 'u' && !is_identifier_byte(source_byte(source, begin, length, position - 4)));
+    }
+    return result;
+}
+
+// In C++, is the identifier at `position` (after a literal's closing quote) a user-defined suffix of the literal? It
+// is if it starts with '_', or (after a string literal) it's one of the standard library's suffixes.
+static bool is_literal_suffix(const uint8_t* source, uint64_t begin, uint64_t length, int64_t position, bool after_string)
+{
+    static const char* const suffixes[] = { "d", "h", "i", "if", "il", "min", "ms", "ns", "s", "sv", "us", "y" };
+    bool result = source_byte(source, begin, length, position) == '_';
+    if (!result && after_string)
+    {
+        char suffix[4];
+        uint32_t suffix_length = 0;
+        while (suffix_length < 4 && (c_char_properties[source_byte(source, begin, length, position + suffix_length) & 0x7F] & CHAR_IDENTIFIER) &&
+               source_byte(source, begin, length, position + suffix_length) < 0x80)
+        {
+            suffix[suffix_length] = (char)source_byte(source, begin, length, position + suffix_length);
+            suffix_length += 1;
+        }
+        for (uint32_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i += 1)
+        {
+            result |= strlen(suffixes[i]) == suffix_length && memcmp(suffixes[i], suffix, suffix_length) == 0;
+        }
     }
     return result;
 }
@@ -304,6 +370,7 @@ enum
     M_HASHDIG, // the ':' of "%:"
     M_OP2, // the last character of a pair of characters that make a punctuator
     M_OP3, // the last character of "...", "<<=" or ">>="
+    M_OP3_CXX, // in C++, the last character of what may be "<=>" or "->*" (if it starts with '<' or '-')
     M_NONASCII,
     NUM_MASKS,
 };
@@ -319,10 +386,40 @@ typedef enum State
     STATE_BLOCK_COMMENT,
 } State;
 
-#define NEEDS_SCALAR C_TOKENIZER_ERROR_NEEDS_SCALAR
+// The last chunk with a line start (a newline outside of block comments), from which the scalar lexer restarts if a
+// later chunk needs it: the tokens on the line before such a chunk may be wrong (a splice can join one with what
+// follows).
+typedef struct LastLine LastLine;
+struct LastLine
+{
+    u64x8 line_breaks;
+    u64x8 token_starts;
+    int64_t chunk_position;
+    uint64_t first_token; // How many tokens start before the chunk.
+    bool valid; // Else the scalar lexer restarts at the beginning.
+};
+
+// For a chunk that needs the scalar lexer: it takes over from `restart` (where `written` tokens have been written)
+// until `scalar_until` (the end of the chunk).
+__attribute__((cold, noinline)) static int64_t needs_scalar(const LastLine* last_line, uint64_t begin, int64_t chunk_position, uint64_t* written, uint64_t* restart,
+                            uint64_t* scalar_until)
+{
+    *restart = begin;
+    *written = 0;
+    if (last_line->valid)
+    {
+        const uint32_t line_start = (uint32_t)highest_bit_below(last_line->line_breaks, 512) + 1;
+        *restart = (uint64_t)(last_line->chunk_position + line_start);
+        *written = last_line->first_token + (uint64_t)_mm512_reduce_add_epi64(_mm512_popcnt_epi64((__m512i)(last_line->token_starts & bits_below(line_start))));
+    }
+    *scalar_until = (uint64_t)(chunk_position + 512);
+    return C_TOKENIZER_ERROR_NEEDS_SCALAR;
+}
+
+#define NEEDS_SCALAR needs_scalar(&last_line, begin, chunk_position, written, restart, scalar_until)
 
 // Phase I for one 64-byte vector: its character-class bitstrings, stored to `o[...][lane]`.
-INLINE void classify(__m512i raw, uint64_t o[][16], unsigned lane, __m512i* previous_classes, __m512i* previous_pairs)
+INLINE void classify(__m512i raw, uint64_t o[][16], unsigned lane, __m512i* previous_classes, __m512i* previous_pairs, const bool cplusplus)
 {
     const uint64_t nonascii = _mm512_movepi8_mask(raw);
     __m512i properties = perm2b(c_char_properties, raw);
@@ -337,7 +434,7 @@ INLINE void classify(__m512i raw, uint64_t o[][16], unsigned lane, __m512i* prev
     const __m512i previous = shift_in_previous(classes, *previous_classes);
     const __m512i allowed = _mm512_mask_blend_epi8(_mm512_cmpeq_epi8_mask(previous, classes), splat8((uint8_t)~SAME_CHARACTER_CHANNELS), splat8(0xFF));
     const __m512i pairs = vpshufb(c_second_char_channels, classes) & vpshufb(c_first_char_channels, previous) & allowed;
-    const __m512i triples = vpshufb(c_third_char_channels, classes) & shift_in_previous(pairs, *previous_pairs);
+    const __m512i triples = vpshufb(cplusplus ? c_third_char_channels_cxx : c_third_char_channels, classes) & shift_in_previous(pairs, *previous_pairs);
 
     o[M_NEWLINE][lane] = _mm512_test_epi8_mask(properties, splat8(CHAR_NEWLINE));
     o[M_WHITESPACE][lane] = _mm512_test_epi8_mask(properties, splat8(CHAR_WHITESPACE));
@@ -353,17 +450,15 @@ INLINE void classify(__m512i raw, uint64_t o[][16], unsigned lane, __m512i* prev
     o[M_EXPSIGN][lane] = _mm512_test_epi8_mask(pairs, splat8(CHANNEL_EXPSIGN));
     o[M_HASHDIG][lane] = _mm512_test_epi8_mask(pairs, splat8(CHANNEL_HASHDIG));
     o[M_OP2][lane] = _mm512_test_epi8_mask(pairs, splat8(OP2_CHANNELS));
-    o[M_OP3][lane] = _mm512_test_epi8_mask(triples, triples);
+    o[M_OP3][lane] = _mm512_test_epi8_mask(triples, splat8(CHANNEL_SHIFT | CHANNEL_DOTS));
+    if (cplusplus)
+    {
+        o[M_OP3_CXX][lane] = _mm512_test_epi8_mask(triples, splat8(CHANNEL_EQ | CHANNEL_GT));
+    }
     o[M_NONASCII][lane] = nonascii;
 
     *previous_classes = classes;
     *previous_pairs = pairs;
-}
-
-// The byte at `position` of the source, or a newline outside of [`begin`, `length`).
-INLINE uint8_t source_byte(const uint8_t* source, uint64_t begin, uint64_t length, int64_t position)
-{
-    return position >= (int64_t)begin && position < (int64_t)length ? source[position] : '\n';
 }
 
 // The kind of the prefixed literal whose prefix starts at `position`: L, u8, u or U and then a quote.
@@ -481,19 +576,21 @@ INLINE Scan scan_lines(u64x8 cursors, State state, uint32_t block_comment_skip, 
     return result;
 }
 
-static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* restrict kinds_out, uint32_t* restrict starts_out,
-                               uint32_t* restrict ends_out)
+// Tokenizes the source from `begin` (the start of the source, or of a line) to its end, or until a chunk that needs
+// the scalar lexer (see NEEDS_SCALAR).
+INLINE int64_t tokenize_chunks(const bool cplusplus, const uint8_t* source, uint64_t length, uint64_t begin, uint8_t* restrict kinds_out,
+                               uint32_t* restrict starts_out, uint32_t* restrict ends_out, uint64_t* written, uint64_t* restart, uint64_t* scalar_until)
 {
     const u64x8 zero = {0};
     const u64x8 bit_0 = {1, 0, 0, 0, 0, 0, 0, 0};
     const u64x8 most_significant = {0, 0, 0, 0, 0, 0, 0, 1ull << 63};
     const u64x8 odd_bits = 0xAAAAAAAAAAAAAAAAull;
 
-    // The source is read in 64-byte-aligned lanes; the bytes before it (and its UTF-8 byte order mark) and after it
-    // read as newlines. Positions are relative to the source, so the first chunk can start at a negative one.
-    const uint64_t begin = length >= 3 && source[0] == 0xEF && source[1] == 0xBB && source[2] == 0xBF ? 3 : 0;
+    // The source is read in 64-byte-aligned lanes; the bytes before `begin` and after the source read as newlines.
+    // Positions are relative to the source, so the first chunk can start at a negative one.
     const uint8_t* const base = (const uint8_t*)((uintptr_t)source & ~(uintptr_t)63);
     const int64_t base_offset = (int64_t)(base - source);
+    const int64_t first_chunk = ((int64_t)begin - base_offset) & ~(int64_t)63;
 
     // What the previous chunk passes on. Bitstrings only matter for their top bits.
     u64x8 previous_identifier = zero;
@@ -501,6 +598,7 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
     u64x8 previous_star = zero;
     u64x8 previous_number_token = zero;
     u64x8 previous_identifier_token = zero;
+    u64x8 previous_unknown_openers = zero;
     u64x8 previous_splice_backslash = zero;
     u64x8 previous_splice_cr = zero;
     u64x8 next_is_escaped = zero; // At bit 0.
@@ -512,6 +610,8 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
     uint64_t covered_end = 0; // and the last of them.
     uint64_t suppressed_starts = 0; // The quote of a prefixed literal that starts in the previous chunk,
     uint64_t suppressed_ends = 0; // and the '8' of its "u8" prefix.
+
+    LastLine last_line = { .valid = false };
 
     uint8_t* cur_kind = kinds_out;
     uint32_t* cur_start = starts_out;
@@ -526,11 +626,11 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
     __m512i previous_pairs = _mm512_setzero_si512();
     for (unsigned j = 0; j < 9; j += 1)
     {
-        raws[0][j] = load_lane(base, base_offset, begin, length, 64 * j);
-        classify(raws[0][j], masks[0], j, &previous_classes, &previous_pairs);
+        raws[0][j] = load_lane(base, base_offset, begin, length, first_chunk + 64 * j);
+        classify(raws[0][j], masks[0], j, &previous_classes, &previous_pairs, cplusplus);
     }
 
-    for (int64_t chunk = 0, current = 0;; chunk += 512, current ^= 1)
+    for (int64_t chunk = first_chunk, current = 0;; chunk += 512, current ^= 1)
     {
         uint64_t (*o)[16] = masks[current];
         const __m512i* raw = raws[current];
@@ -550,7 +650,7 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
             for (unsigned j = 1; j < 9; j += 1)
             {
                 next_raw[j] = load_lane(base, base_offset, begin, length, chunk + 512 + 64 * j);
-                classify(next_raw[j], next_o, j, &previous_classes, &previous_pairs);
+                classify(next_raw[j], next_o, j, &previous_classes, &previous_pairs, cplusplus);
             }
         }
         u64x8 padding = zero;
@@ -582,6 +682,7 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
         const u64x8 pair_ends = MASK(M_OP2);
         const u64x8 triple_ends = MASK(M_OP3);
         const u64x8 nonascii = MASK(M_NONASCII);
+        const u64x8 cxx_triple_ends = cplusplus ? MASK(M_OP3_CXX) : zero;
 
         // II. Analysis
 
@@ -622,7 +723,7 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
                     {
                         return NEEDS_SCALAR;
                     }
-                    if (splice_joins(source_byte(source, begin, length, position - 2), before, after))
+                    if (splice_joins(source_byte(source, begin, length, position - 2), before, after, cplusplus))
                     {
                         joining_splices[j] |= bits & -bits;
                     }
@@ -693,6 +794,22 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
         if (UNLIKELY(!is_zero((block_comment_marks & block_comment_closers) | (block_comment_marks & shr_next(block_comment_closers, next_closers, 2)))))
         {
             return NEEDS_SCALAR; // "*/*" or "/*/"
+        }
+
+        // C++'s raw string literals need the scalar lexer.
+        if (cplusplus && UNLIKELY(!is_zero(quote & shl_carry(identifier, previous_identifier, 1)) || (bit_511(identifier) && (NEXT(M_QUOTE) & 1))))
+        {
+            const u64x8 after_identifier = quote & shl_carry(identifier, previous_identifier, 1);
+            for (uint32_t lane = 0; lane < 9; lane += 1)
+            {
+                for (uint64_t bits = lane < 8 ? after_identifier[lane] : NEXT(M_QUOTE) & bit_511(identifier); bits != 0; bits &= bits - 1)
+                {
+                    if (is_raw_string_quote(source, begin, length, chunk_position + 64 * lane + __builtin_ctzll(bits)))
+                    {
+                        return NEEDS_SCALAR;
+                    }
+                }
+            }
         }
 
         // Find the literals and comments, line by line in parallel (see `scan_lines`). The scan starts each line
@@ -839,7 +956,47 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
         u64x8 quads = hash_digraphs & shr_next(hash_digraphs, NEXT(M_HASHDIG) >> 1, 2) & candidate;
         u64x8 triples = shr_next(triple_ends, NEXT(M_OP3), 2) & candidate & ~quads;
         u64x8 pairs = shr_next(pair_ends, NEXT(M_OP2), 1) & candidate & ~triples & ~quads;
+        if (cplusplus)
+        {
+            // "<=>" and "->*": the triple candidates that start with '<' and '-' (rare, so checked one at a time).
+            const u64x8 cxx_triple_starts = shr_next(cxx_triple_ends, NEXT(M_OP3_CXX), 2) & candidate & ~quads;
+            if (UNLIKELY(!is_zero(cxx_triple_starts)))
+            {
+                for (uint32_t lane = 0; lane < 8; lane += 1)
+                {
+                    for (uint64_t bits = cxx_triple_starts[lane]; bits != 0; bits &= bits - 1)
+                    {
+                        const int64_t position = chunk_position + 64 * lane + __builtin_ctzll(bits);
+                        const uint8_t first = source_byte(source, begin, length, position);
+                        if (first == (source_byte(source, begin, length, position + 2) == '>' ? '<' : '-'))
+                        {
+                            triples[lane] |= bits & -bits;
+                        }
+                    }
+                }
+                pairs &= ~triples;
+            }
+            // ".*"
+            pairs |= dot & shr_next(star, NEXT(M_STAR), 1) & candidate & ~triples & ~quads;
+        }
         u64x8 covers = shl(pairs, 1) | shl(triples, 1) | shl(triples, 2) | shl(quads, 1) | shl(quads, 2) | shl(quads, 3);
+        if (cplusplus && UNLIKELY(!is_zero((pairs | triples | quads) & covers) || bit_511(pairs)))
+        {
+            // "<::" is '<' and "::" unless a ':' or '>' follows: then its "<:" isn't a candidate.
+            u64x8 less;
+            u64x8 colon;
+            u64x8 colon_or_greater;
+            for (unsigned j = 0; j < 8; j += 1)
+            {
+                less[j] = _mm512_cmpeq_epi8_mask(raw[j], splat8('<'));
+                colon[j] = _mm512_cmpeq_epi8_mask(raw[j], splat8(':'));
+                colon_or_greater[j] = colon[j] | _mm512_cmpeq_epi8_mask(raw[j], splat8('>'));
+            }
+            const uint64_t next_colon = _mm512_cmpeq_epi8_mask(raw[8], splat8(':'));
+            const uint64_t next_colon_or_greater = next_colon | _mm512_cmpeq_epi8_mask(raw[8], splat8('>'));
+            pairs &= ~(less & shr_next(colon, next_colon, 1) & shr_next(colon, next_colon, 2) & ~shr_next(colon_or_greater, next_colon_or_greater, 3));
+            covers = shl(pairs, 1) | shl(triples, 1) | shl(triples, 2) | shl(quads, 1) | shl(quads, 2) | shl(quads, 3);
+        }
         if (UNLIKELY(!is_zero((pairs | triples | quads) & covers)))
         {
             // Overlapping candidates, like "+++": take the longest from the left, then the next one that is left.
@@ -950,7 +1107,39 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
 
         u64x8 all_ends = number_ends | identifier_ends | multi_ends | singles | literal_token_ends;
         all_ends[0] |= covered_end;
-        const u64x8 all_starts = number_starts | identifier_starts | multi_starts | singles | literal_starts_token;
+        u64x8 all_starts = number_starts | identifier_starts | multi_starts | singles | literal_starts_token;
+        // C++'s user-defined literal suffixes: an identifier right after a literal's closing quote is part of the
+        // literal if it starts with '_' or (after a string literal) is a standard library suffix.
+        if (cplusplus)
+        {
+            const uint64_t next_identifier_start = NEXT(M_IDENTIFIER) & ~NEXT(M_DIGIT) & 1;
+            const u64x8 suffixed = literal_closers & ~shl_carry(unknown_openers, previous_unknown_openers, 1) & shr_next(identifier_starts, next_identifier_start, 1);
+            if (UNLIKELY(!is_zero(suffixed)))
+            {
+                for (uint32_t lane = 0; lane < 8; lane += 1)
+                {
+                    for (uint64_t bits = suffixed[lane]; bits != 0; bits &= bits - 1)
+                    {
+                        const int64_t position = chunk_position + 64 * lane + __builtin_ctzll(bits);
+                        if (is_literal_suffix(source, begin, length, position + 1, source_byte(source, begin, length, position) == '"'))
+                        {
+                            // The literal ends with the suffix, whose start (maybe in the next chunk) isn't a token's.
+                            const uint32_t suffix = lane * 64 + (uint32_t)__builtin_ctzll(bits) + 1;
+                            all_ends[lane] &= ~(bits & -bits);
+                            if (suffix < 512)
+                            {
+                                all_starts[suffix >> 6] &= ~(1ull << (suffix & 63));
+                            }
+                            else
+                            {
+                                next_suppressed_starts |= 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        all_starts[0] &= ~suppressed_starts;
 
         // The first token after each newline that starts a logical line (not one in a block comment).
         const u64x8 line_starts = line_break & ~block_region;
@@ -958,6 +1147,12 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
         const u64x8 seek = sub(seek_in, shl(line_starts, 1) | (pending_start_of_line ? bit_0 : zero));
         const u64x8 start_of_line = all_starts & ~seek;
         pending_start_of_line = bit_511(line_starts) || bit_511(seek & ~seek_in);
+
+        if (!is_zero(line_starts))
+        {
+            last_line = (LastLine){ .line_breaks = line_starts, .token_starts = all_starts, .chunk_position = chunk_position,
+                                    .first_token = (uint64_t)(cur_kind - kinds_out), .valid = true };
+        }
 
         // III. Write-out
         uint64_t starts_lanes[8];
@@ -1040,6 +1235,7 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
         previous_star = star;
         previous_number_token = number_token;
         previous_identifier_token = identifier_token;
+        previous_unknown_openers = unknown_openers;
         number_carry = number_carry_out;
         state = next_state;
         block_comment_skip = next_block_comment_skip;
@@ -1059,6 +1255,23 @@ static int64_t tokenize_chunks(const uint8_t* source, uint64_t length, uint8_t* 
     return cur_kind - kinds_out;
 }
 
+// The chunk loop, specialized for each language.
+__attribute__((noinline)) static int64_t tokenize_c(const uint8_t* source, uint64_t length, uint64_t begin, uint8_t* kinds, uint32_t* starts,
+                                                    uint32_t* ends, uint64_t* written, uint64_t* restart, uint64_t* scalar_until)
+{
+    return tokenize_chunks(false, source, length, begin, kinds, starts, ends, written, restart, scalar_until);
+}
+
+__attribute__((noinline)) static int64_t tokenize_cpp(const uint8_t* source, uint64_t length, uint64_t begin, uint8_t* kinds, uint32_t* starts,
+                                                      uint32_t* ends, uint64_t* written, uint64_t* restart, uint64_t* scalar_until)
+{
+    return tokenize_chunks(true, source, length, begin, kinds, starts, ends, written, restart, scalar_until);
+}
+
+// In c_tokenizer_scalar.c.
+uint64_t c_tokenize_scalar_range(const uint8_t* source, uint64_t length, uint64_t position, bool start_of_line, uint64_t stop_at,
+                                 uint8_t* kinds, uint32_t* starts, uint32_t* ends, uint64_t count, uint32_t flags, uint64_t* resume);
+
 int64_t c_tokenize_vectorized(const uint8_t* source, uint64_t length, uint8_t* kinds, uint32_t* starts, uint32_t* ends, uint32_t flags)
 {
     int64_t result;
@@ -1076,17 +1289,52 @@ int64_t c_tokenize_vectorized(const uint8_t* source, uint64_t length, uint8_t* k
     }
     else
     {
-        result = tokenize_chunks(source, length, kinds, starts, ends);
+        const uint64_t begin = length >= 3 && source[0] == 0xEF && source[1] == 0xBB && source[2] == 0xBF ? 3 : 0;
+        uint64_t written;
+        uint64_t restart;
+        uint64_t scalar_until;
+        result = (flags & C_TOKENIZER_CPLUSPLUS) ? tokenize_cpp(source, length, begin, kinds, starts, ends, &written, &restart, &scalar_until)
+                                                 : tokenize_c(source, length, begin, kinds, starts, ends, &written, &restart, &scalar_until);
     }
     return result;
 }
 
 int64_t c_tokenize(const uint8_t* source, uint64_t length, uint8_t* kinds, uint32_t* starts, uint32_t* ends, uint32_t flags)
 {
-    int64_t result = c_tokenize_vectorized(source, length, kinds, starts, ends, flags);
-    if (result == C_TOKENIZER_ERROR_NEEDS_SCALAR)
+    if (length > UINT32_MAX - 128)
     {
-        result = c_tokenize_scalar(source, length, kinds, starts, ends, flags);
+        return C_TOKENIZER_ERROR_FILE_TOO_BIG;
     }
-    return result;
+    if (length == 0)
+    {
+        return 0;
+    }
+    if ((flags & C_TOKENIZER_TRIGRAPHS) && contains_trigraph(source, length))
+    {
+        return c_tokenize_scalar(source, length, kinds, starts, ends, flags);
+    }
+
+    // The vectorized path, until a chunk it can't tokenize. Then the scalar lexer goes back to the start of the line
+    // before that chunk and lexes up to the first line that starts after it, and the vectorized path resumes there.
+    uint64_t begin = length >= 3 && source[0] == 0xEF && source[1] == 0xBB && source[2] == 0xBF ? 3 : 0;
+    uint64_t count = 0;
+    for (;;)
+    {
+        uint64_t written;
+        uint64_t restart;
+        uint64_t scalar_until;
+        const int64_t result =
+            (flags & C_TOKENIZER_CPLUSPLUS)
+                ? tokenize_cpp(source, length, begin, kinds + count, starts + count, ends + count, &written, &restart, &scalar_until)
+                : tokenize_c(source, length, begin, kinds + count, starts + count, ends + count, &written, &restart, &scalar_until);
+        if (result >= 0)
+        {
+            return (int64_t)count + result;
+        }
+        count = c_tokenize_scalar_range(source, length, restart, true, scalar_until, kinds, starts, ends, count + written, flags, &begin);
+        if (begin >= length)
+        {
+            return (int64_t)count;
+        }
+    }
 }

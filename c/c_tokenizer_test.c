@@ -1,8 +1,9 @@
 // Tests the vectorized C tokenizer (c_tokenizer.c) against the scalar lexer token by token, then benchmarks it.
 //
-// Usage: c_tokenizer_test [--fuzz N] [--seed N] [--no-bench] path...
-// Paths are files or directories (searched for .c and .h files). The checks are: every file of the corpus, a snippet
-// slid across the 64- and 512-byte boundaries, and N random inputs (default 200000). Run it pinned to one CPU
+// Usage: c_tokenizer_test [--cplusplus] [--fuzz N] [--seed N] [--no-bench] path...
+// Paths are files or directories (searched for .c and .h files, or with --cplusplus for C++ sources and headers,
+// including extensionless ones like <vector>). The checks are: every file of the corpus, a snippet slid across the
+// 64- and 512-byte boundaries, and N random inputs (default 200000). --cplusplus tokenizes all of them as C++. Run it pinned to one CPU
 // (`taskset -c 2 ...`) for stable numbers. The scalar lexer itself is checked against clang by c/c_tokenizer_oracle.py.
 #define _GNU_SOURCE
 #include "c_tokenizer.h"
@@ -48,13 +49,43 @@ struct Output
     uint32_t* ends;
 };
 
-static bool has_c_extension(const char* name)
+// C_TOKENIZER_CPLUSPLUS to tokenize C++.
+static uint32_t language_flags = 0;
+
+static bool ends_with(const char* name, const char* suffix)
 {
     uint64_t n = strlen(name);
-    return n >= 2 && name[n - 2] == '.' && (name[n - 1] == 'c' || name[n - 1] == 'h');
+    uint64_t m = strlen(suffix);
+    return n >= m && memcmp(name + n - m, suffix, m) == 0;
 }
 
-static void add_file(Corpus* corpus, const char* path)
+// Is a file with this name source code of the language (0 if it is in C++ only when it's text)?
+static int is_source_name(const char* name)
+{
+    static const char* const cpp_extensions[] = { ".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++", ".h", ".inc", ".def", ".ipp", ".tcc", ".tpp" };
+    int result = -1;
+    if (language_flags & C_TOKENIZER_CPLUSPLUS)
+    {
+        for (uint64_t i = 0; i < sizeof(cpp_extensions) / sizeof(cpp_extensions[0]); i += 1)
+        {
+            if (ends_with(name, cpp_extensions[i]))
+            {
+                result = 1;
+            }
+        }
+        if (result == -1 && strchr(name, '.') == 0)
+        {
+            result = 0;
+        }
+    }
+    else if (ends_with(name, ".c") || ends_with(name, ".h"))
+    {
+        result = 1;
+    }
+    return result;
+}
+
+static void add_file(Corpus* corpus, const char* path, bool only_text)
 {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd == -1)
@@ -75,6 +106,12 @@ static void add_file(Corpus* corpus, const char* path)
                 break;
             }
             read_bytes += (uint64_t)n;
+        }
+        if (only_text && (read_bytes == 0 || memchr(bytes, 0, read_bytes < 4096 ? read_bytes : 4096) != 0))
+        {
+            free(bytes);
+            close(fd);
+            return;
         }
         if (corpus->count == corpus->capacity)
         {
@@ -102,7 +139,7 @@ static void add_path(Corpus* corpus, const char* path)
     }
     if (!S_ISDIR(path_stats.st_mode))
     {
-        add_file(corpus, path);
+        add_file(corpus, path, false);
         return;
     }
     DIR* directory = opendir(path);
@@ -128,9 +165,9 @@ static void add_path(Corpus* corpus, const char* path)
         {
             add_path(corpus, child);
         }
-        else if (S_ISREG(child_stats.st_mode) && has_c_extension(entry->d_name))
+        else if (S_ISREG(child_stats.st_mode) && is_source_name(entry->d_name) >= 0)
         {
-            add_file(corpus, child);
+            add_file(corpus, child, is_source_name(entry->d_name) == 0);
         }
     }
     closedir(directory);
@@ -179,15 +216,14 @@ typedef enum Comparison
     COMPARISON_FELL_BACK,
 } Comparison;
 
-// Compares the vectorized path with the scalar lexer on `source`, printing the difference if `name` isn't null.
+// Compares c_tokenize with the scalar lexer on `source`, printing the difference if `name` isn't null. FELL_BACK means
+// they're the same, but the vectorized path left part of the source to the scalar lexer.
 static Comparison compare(const uint8_t* source, uint64_t length, Output* vectorized, Output* scalar, const char* name)
 {
-    int64_t vectorized_count = c_tokenize_vectorized(source, length, vectorized->kinds, vectorized->starts, vectorized->ends, 0);
-    if (vectorized_count == C_TOKENIZER_ERROR_NEEDS_SCALAR)
-    {
-        return COMPARISON_FELL_BACK;
-    }
-    int64_t scalar_count = c_tokenize_scalar(source, length, scalar->kinds, scalar->starts, scalar->ends, 0);
+    const bool fell_back = c_tokenize_vectorized(source, length, vectorized->kinds, vectorized->starts, vectorized->ends, language_flags) ==
+                           C_TOKENIZER_ERROR_NEEDS_SCALAR;
+    int64_t vectorized_count = c_tokenize(source, length, vectorized->kinds, vectorized->starts, vectorized->ends, language_flags);
+    int64_t scalar_count = c_tokenize_scalar(source, length, scalar->kinds, scalar->starts, scalar->ends, language_flags);
     int64_t i = 0;
     while (i < vectorized_count && i < scalar_count && vectorized->kinds[i] == scalar->kinds[i] && vectorized->starts[i] == scalar->starts[i] &&
            vectorized->ends[i] == scalar->ends[i])
@@ -196,7 +232,7 @@ static Comparison compare(const uint8_t* source, uint64_t length, Output* vector
     }
     if (i == vectorized_count && i == scalar_count)
     {
-        return COMPARISON_SAME;
+        return fell_back ? COMPARISON_FELL_BACK : COMPARISON_SAME;
     }
     if (name != 0)
     {
@@ -233,6 +269,18 @@ static const char boundary_snippet[] =
     "'' 'unterminated\n\"unterminated string\nok = \"multi \\\nline string\" 'a\\\nb' @ ` $x a$ ::: <=> ->* .* ## #\r\n"
     "s = \"a\\\\\\\\\" \"tab\tin\" /* \"unterminated\n*/ 'x' // line comment \\\ncontinued\nend;\r\n";
 
+// The same for C++ (raw string literals, which need the scalar lexer, are left out).
+static const char boundary_snippet_cpp[] =
+    "#include <vector> // a \"comment\" with 'quotes' and /* in it\n"
+    "template <class T> auto operator<=>(const T& a, const T& b) { return a.*p <=> (b->*q)(); } /* block\n"
+    " * comment with \"quotes\" and 'apostrophes' don't\n"
+    " */ using namespace std::literals; auto s = \"str\"s + \"x\"sv; auto t = 10ms + 1.5_km + 'c'_ch + u8\"x\"_u8;\n"
+    "std::vector<::std::string> v; template<::T> x <::: y <::> z <:: w a<::b \"%\"PRId64 \"a\"sss \"a\"_ \"a\"$x\n"
+    "x = a+++b - -c --d ->e <<= f >>= g <= h >= i == j != k && l || m *= n /= o %= p += q -= r &= s ^= t |= u;\n"
+    "a<::>b <% %> <: :> ... .. . .... a.b ...5 ...* .** ->** <=>= <==> ==> :>* %>* 1.*2 1'000'000 1'a 0b1010 1$x;\n"
+    "'' ''_x 'unterminated\n\"unterminated string\nok = \"multi \\\nline string\"_sfx 'a\\\nb'_c @ ` $x a$ ::: ## #\r\n"
+    "s = \"a\\\\\\\\\" \"tab\tin\" /* \"unterminated\n*/ 'x' // line comment \\\ncontinued\nend;\r\n";
+
 static uint64_t random_state = 0x9E3779B97F4A7C15ull;
 
 static uint64_t random_next(void)
@@ -251,6 +299,11 @@ static const char* const fuzz_pieces[] = {
     "e+", "1e+", "0x", "'1'", "'a'", "%:", "<:", ":>", "<%", "%>", "->", "++", "<<=", ">>=", "##", "::", "\v", "\f",
 };
 
+// More pieces for C++.
+static const char* const fuzz_pieces_cpp[] = {
+    "<=>", "->*", ".*", "<::", "<::>", "\"x\"_y", "\"x\"s", "\"x\"sv", "'x'_y", "s", "sv", "min", "_", "_x", "R", "LR", "u8R",
+};
+
 // Pieces with a backslash, which often need the scalar lexer outside of literals: they're only used inside of literals
 // in half of the random inputs.
 static bool has_backslash(const char* piece)
@@ -266,7 +319,10 @@ static uint64_t fuzz_input(uint8_t* buffer, uint64_t capacity)
     bool in_literal = false;
     for (uint64_t i = 0; i < pieces; i += 1)
     {
-        const char* piece = fuzz_pieces[random_next() % (sizeof(fuzz_pieces) / sizeof(fuzz_pieces[0]))];
+        const uint64_t count = sizeof(fuzz_pieces) / sizeof(fuzz_pieces[0]);
+        const uint64_t cpp_count = (language_flags & C_TOKENIZER_CPLUSPLUS) ? sizeof(fuzz_pieces_cpp) / sizeof(fuzz_pieces_cpp[0]) : 0;
+        const uint64_t which = random_next() % (count + cpp_count);
+        const char* piece = which < count ? fuzz_pieces[which] : fuzz_pieces_cpp[which - count];
         if (careful)
         {
             if (strcmp(piece, "\"") == 0)
@@ -388,7 +444,18 @@ int main(int argc, char** argv)
         {
             bench = false;
         }
-        else
+        else if (strcmp(argv[i], "--cplusplus") == 0)
+        {
+            language_flags = C_TOKENIZER_CPLUSPLUS;
+        }
+    }
+    for (int i = 1; i < argc; i += 1)
+    {
+        if (strcmp(argv[i], "--fuzz") == 0 || strcmp(argv[i], "--seed") == 0)
+        {
+            i += 1;
+        }
+        else if (argv[i][0] != '-')
         {
             add_path(&corpus, argv[i]);
         }
@@ -413,14 +480,15 @@ int main(int argc, char** argv)
             fell_back_bytes += corpus.sources[i].length;
         }
     }
-    printf("corpus: %lu files differ, %lu files (%.2f%% of bytes) need the scalar lexer\n", (unsigned long)different, (unsigned long)fell_back,
+    printf("corpus: %lu files differ, %lu files (%.2f%% of bytes) need the scalar lexer for a part\n", (unsigned long)different, (unsigned long)fell_back,
            corpus.total_bytes ? 100.0 * (double)fell_back_bytes / (double)corpus.total_bytes : 0.0);
 
     // 2. The snippet at every alignment, after 0 to 1099 bytes of padding.
     {
         uint64_t snippet_different = 0;
         uint64_t snippet_fell_back = 0;
-        uint64_t snippet_length = sizeof(boundary_snippet) - 1;
+        const char* snippet = (language_flags & C_TOKENIZER_CPLUSPLUS) ? boundary_snippet_cpp : boundary_snippet;
+        uint64_t snippet_length = strlen(snippet);
         uint8_t* buffer = aligned_alloc(64, 4096);
         char name[128];
         for (uint64_t misalignment = 0; misalignment < 64; misalignment += 1)
@@ -432,14 +500,14 @@ int main(int argc, char** argv)
                 {
                     buffer[misalignment + p] = p % 61 == 60 ? '\n' : ' ';
                 }
-                memcpy(buffer + misalignment + padding, boundary_snippet, snippet_length);
+                memcpy(buffer + misalignment + padding, snippet, snippet_length);
                 snprintf(name, sizeof(name), "snippet (misalignment %lu, padding %lu)", (unsigned long)misalignment, (unsigned long)padding);
                 Comparison comparison = compare(buffer + misalignment, padding + snippet_length, &vectorized, &scalar, snippet_different < 3 ? name : 0);
                 snippet_different += comparison == COMPARISON_DIFFERENT;
                 snippet_fell_back += comparison == COMPARISON_FELL_BACK;
             }
         }
-        printf("snippet: %lu of %u placements differ, %lu need the scalar lexer\n", (unsigned long)snippet_different, 64 * 1100,
+        printf("snippet: %lu of %u placements differ, %lu need the scalar lexer for a part\n", (unsigned long)snippet_different, 64 * 1100,
                (unsigned long)snippet_fell_back);
         free(buffer);
         different += snippet_different;
@@ -472,7 +540,7 @@ int main(int argc, char** argv)
             fuzz_different += comparison == COMPARISON_DIFFERENT;
             fuzz_fell_back += comparison == COMPARISON_FELL_BACK;
         }
-        printf("random: %lu of %lu inputs differ, %lu need the scalar lexer\n", (unsigned long)fuzz_different, (unsigned long)fuzz_count,
+        printf("random: %lu of %lu inputs differ, %lu need the scalar lexer for a part\n", (unsigned long)fuzz_different, (unsigned long)fuzz_count,
                (unsigned long)fuzz_fell_back);
         free(buffer);
         different += fuzz_different;
@@ -495,7 +563,7 @@ int main(int argc, char** argv)
                 uint64_t pass_tokens = 0;
                 for (uint64_t i = 0; i < corpus.count; i += 1)
                 {
-                    pass_tokens += (uint64_t)functions[which](corpus.sources[i].bytes, corpus.sources[i].length, output->kinds, output->starts, output->ends, 0);
+                    pass_tokens += (uint64_t)functions[which](corpus.sources[i].bytes, corpus.sources[i].length, output->kinds, output->starts, output->ends, language_flags);
                 }
                 Sample after = sample_now(&counters);
                 tokens = pass_tokens;

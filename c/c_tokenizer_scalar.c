@@ -4,6 +4,7 @@
 #include "c_tokenizer_unicode.h"
 
 #include <stdbool.h>
+#include <string.h>
 
 #define ARRAY_LENGTH(x) (sizeof(x) / sizeof((x)[0]))
 #define END_OF_FILE (-1)
@@ -16,6 +17,7 @@ struct ScalarLexer
     const uint8_t* source;
     uint64_t length;
     bool trigraphs;
+    bool cplusplus;
 };
 
 typedef struct TokenOutput TokenOutput;
@@ -416,8 +418,129 @@ static uint64_t lex_numeric_constant(const ScalarLexer* lexer, uint64_t position
     return p;
 }
 
+// The suffixes of the standard library's string literal operators, which (unlike others) don't start with '_'.
+static bool is_standard_suffix(const char* suffix, uint32_t length)
+{
+    static const char* const suffixes[] = { "d", "h", "i", "if", "il", "min", "ms", "ns", "s", "sv", "us", "y" };
+    bool result = false;
+    for (uint32_t i = 0; i < ARRAY_LENGTH(suffixes); i += 1)
+    {
+        result |= strlen(suffixes[i]) == length && memcmp(suffixes[i], suffix, length) == 0;
+    }
+    return result;
+}
+
+// clang's LexUDSuffix (C++): the end of the user-defined literal suffix after the literal that ends at `position`
+// (`position` itself if it has none).
+static uint64_t lex_ud_suffix(const ScalarLexer* lexer, uint64_t position, bool is_string)
+{
+    uint64_t p = position;
+    uint64_t size;
+    int32_t c = peek_char(lexer, p, &size);
+    bool consumed = false;
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'))
+    {
+        if (!((c == '\\' && try_consume_identifier_ucn(lexer, p, &p)) || (c >= 0x80 && try_consume_identifier_utf8(lexer, p, &p))))
+        {
+            return position;
+        }
+        consumed = true;
+    }
+    if (!consumed)
+    {
+        // A suffix must start with '_', unless it's one of the standard library's (after a string literal).
+        bool is_suffix = c == '_';
+        if (!is_suffix && is_string)
+        {
+            char suffix[3] = { (char)c };
+            uint32_t length = 1;
+            uint64_t q = p + size;
+            for (;;)
+            {
+                uint64_t next_size;
+                int32_t next = peek_char(lexer, q, &next_size);
+                if (!is_ascii_identifier_continue(next) && next != '$')
+                {
+                    is_suffix = is_standard_suffix(suffix, length);
+                    break;
+                }
+                if (length == 3)
+                {
+                    break;
+                }
+                suffix[length] = (char)next;
+                length += 1;
+                q += next_size;
+            }
+        }
+        if (!is_suffix)
+        {
+            return position;
+        }
+        p += size;
+    }
+    for (;;)
+    {
+        c = peek_char(lexer, p, &size);
+        if (is_ascii_identifier_continue(c) || c == '$')
+        {
+            p += size;
+        }
+        else if (!((c == '\\' && try_consume_identifier_ucn(lexer, p, &p)) || (c >= 0x80 && try_consume_identifier_utf8(lexer, p, &p))))
+        {
+            break;
+        }
+    }
+    return p;
+}
+
+// clang's LexRawStringLiteral (C++): returns the end of the raw string literal whose `R"` ends at `position`, and
+// turns `kind` into `C_TOKEN_UNKNOWN` if its delimiter is invalid or it is unterminated. Inside of it, trigraphs and
+// line splices are undone, so it is read from the source bytes.
+static uint64_t lex_raw_string(const ScalarLexer* lexer, uint64_t position, uint8_t* kind)
+{
+    const uint8_t* s = lexer->source;
+    const uint64_t n = lexer->length;
+    // The delimiter: up to 16 printable characters other than space, '(', ')' and '\\', then '('.
+    uint64_t delimiter_length = 0;
+    while (delimiter_length != 16 && position + delimiter_length < n && s[position + delimiter_length] > ' ' && s[position + delimiter_length] < 0x7F &&
+           s[position + delimiter_length] != '(' && s[position + delimiter_length] != ')' && s[position + delimiter_length] != '\\')
+    {
+        delimiter_length += 1;
+    }
+    uint64_t p = position;
+    if (position + delimiter_length >= n || s[position + delimiter_length] != '(')
+    {
+        // An unknown token, up to the next '"'.
+        while (p < n && s[p] != '"')
+        {
+            p += 1;
+        }
+        *kind = C_TOKEN_UNKNOWN;
+        return p < n ? p + 1 : n;
+    }
+    p = position + delimiter_length + 1;
+    for (;;)
+    {
+        if (p >= n)
+        {
+            *kind = C_TOKEN_UNKNOWN;
+            return n;
+        }
+        const uint8_t c = s[p];
+        p += 1;
+        if (c == ')' && p + delimiter_length < n && memcmp(s + p, s + position, delimiter_length) == 0 && s[p + delimiter_length] == '"')
+        {
+            p += delimiter_length + 1;
+            break;
+        }
+    }
+    return lex_ud_suffix(lexer, p, true);
+}
+
 // clang's LexCharConstant and LexStringLiteral: returns the end of the literal whose opening quote ends at
 // `position`, and turns `kind` into `C_TOKEN_UNKNOWN` if the literal is unterminated (or an empty character constant).
+// In C++, a user-defined suffix is part of the literal.
 static uint64_t lex_char_or_string(const ScalarLexer* lexer, uint64_t position, int32_t quote, uint8_t* kind)
 {
     uint64_t p = position;
@@ -449,7 +572,7 @@ static uint64_t lex_char_or_string(const ScalarLexer* lexer, uint64_t position, 
         c = peek_char(lexer, p, &size);
         p += size;
     }
-    return p;
+    return lexer->cplusplus ? lex_ud_suffix(lexer, p, quote == '"') : p;
 }
 
 // Skips the block comment whose "/*" ends at `position`. Returns false if it is unterminated.
@@ -513,22 +636,23 @@ static uint8_t punctuator2(const ScalarLexer* lexer, uint64_t* position, int32_t
     return result;
 }
 
-int64_t c_tokenize_scalar(const uint8_t* source, uint64_t length, uint8_t* kinds, uint32_t* starts, uint32_t* ends, uint32_t flags)
+// Lexes from `position`, where a token may start (`start_of_line` if no token has started its logical line yet),
+// writing the tokens to `kinds`, `starts` and `ends` from `count` on. Stops at the end of the source, or after the
+// first newline at or past `stop_at` that is outside of tokens and comments: `resume` is then the position after it
+// (else the length). Returns the new count. c_tokenize uses this for the parts its vectorized path can't do.
+uint64_t c_tokenize_scalar_range(const uint8_t* source, uint64_t length, uint64_t position, bool start_of_line, uint64_t stop_at,
+                                 uint8_t* kinds, uint32_t* starts, uint32_t* ends, uint64_t count, uint32_t flags, uint64_t* resume)
 {
-    if (length > UINT32_MAX - 128)
-    {
-        return C_TOKENIZER_ERROR_FILE_TOO_BIG;
-    }
-
-    ScalarLexer lexer_value = { .source = source, .length = length, .trigraphs = (flags & C_TOKENIZER_TRIGRAPHS) != 0 };
+    ScalarLexer lexer_value = {
+        .source = source,
+        .length = length,
+        .trigraphs = (flags & C_TOKENIZER_TRIGRAPHS) != 0,
+        .cplusplus = (flags & C_TOKENIZER_CPLUSPLUS) != 0,
+    };
     const ScalarLexer* lexer = &lexer_value;
-    TokenOutput output = { .kinds = kinds, .starts = starts, .ends = ends, .count = 0, .start_of_line = true };
-
-    uint64_t p = 0;
-    if (length >= 3 && source[0] == 0xEF && source[1] == 0xBB && source[2] == 0xBF)
-    {
-        p = 3;
-    }
+    TokenOutput output = { .kinds = kinds, .starts = starts, .ends = ends, .count = count, .start_of_line = start_of_line };
+    uint64_t p = position;
+    *resume = length;
 
     for (;;)
     {
@@ -550,6 +674,11 @@ int64_t c_tokenize_scalar(const uint8_t* source, uint64_t length, uint8_t* kinds
                 continue;
             case '\n': case '\r':
                 output.start_of_line = true;
+                if (start >= stop_at)
+                {
+                    *resume = p;
+                    return output.count;
+                }
                 continue;
             case '/':
                 c2 = peek_char(lexer, p, &size2);
@@ -580,24 +709,45 @@ int64_t c_tokenize_scalar(const uint8_t* source, uint64_t length, uint8_t* kinds
                 kind = C_TOKEN_CHAR_CONSTANT;
                 p = lex_char_or_string(lexer, p, '\'', &kind);
                 break;
-            case 'L': case 'u': case 'U':
+            case 'L': case 'u': case 'U': case 'R':
             {
-                // Prefixed character constants and string literals: L, u8, u and U, in the order of the kinds.
-                uint8_t prefix = c == 'L' ? 1 : c == 'u' ? 3 : 4;
+                // Prefixed character constants and string literals: L, u8, u and U, in the order of the kinds. In
+                // C++, R (after one of those or alone) starts a raw string literal.
+                uint8_t prefix = c == 'L' ? 1 : c == 'u' ? 3 : c == 'U' ? 4 : 0;
                 c2 = peek_char(lexer, p, &size2);
                 uint64_t quote_end = p + size2;
                 if (c == 'u' && c2 == '8')
                 {
                     uint64_t size3;
                     int32_t c3 = peek_char(lexer, quote_end, &size3);
-                    if (c3 == '"' || c3 == '\'')
+                    if (c3 == '"' || c3 == '\'' || (c3 == 'R' && lexer->cplusplus))
                     {
                         prefix = 2;
                         c2 = c3;
                         quote_end += size3;
                     }
                 }
-                if (c2 == '"' || c2 == '\'')
+                bool raw = false;
+                if (lexer->cplusplus && (c == 'R' || c2 == 'R'))
+                {
+                    uint64_t size3;
+                    if (c == 'R')
+                    {
+                        raw = c2 == '"';
+                    }
+                    else if (peek_char(lexer, quote_end, &size3) == '"')
+                    {
+                        raw = true;
+                        c2 = '"';
+                        quote_end += size3;
+                    }
+                }
+                if (raw)
+                {
+                    kind = (uint8_t)(C_TOKEN_STRING_LITERAL + prefix);
+                    p = lex_raw_string(lexer, quote_end, &kind);
+                }
+                else if (c != 'R' && (c2 == '"' || c2 == '\''))
                 {
                     kind = (uint8_t)((c2 == '"' ? C_TOKEN_STRING_LITERAL : C_TOKEN_CHAR_CONSTANT) + prefix);
                     p = lex_char_or_string(lexer, quote_end, c2, &kind);
@@ -619,6 +769,11 @@ int64_t c_tokenize_scalar(const uint8_t* source, uint64_t length, uint8_t* kinds
                 {
                     kind = C_TOKEN_NUMERIC_CONSTANT;
                     p = lex_numeric_constant(lexer, p + size2);
+                }
+                else if (c2 == '*' && lexer->cplusplus)
+                {
+                    kind = C_TOKEN_PERIODSTAR;
+                    p += size2;
                 }
                 else
                 {
@@ -648,6 +803,12 @@ int64_t c_tokenize_scalar(const uint8_t* source, uint64_t length, uint8_t* kinds
                 {
                     kind = c2 == '-' ? C_TOKEN_MINUSMINUS : c2 == '>' ? C_TOKEN_ARROW : C_TOKEN_MINUSEQUAL;
                     p += size2;
+                    uint64_t size3;
+                    if (c2 == '>' && lexer->cplusplus && peek_char(lexer, p, &size3) == '*')
+                    {
+                        kind = C_TOKEN_ARROWSTAR;
+                        p += size3;
+                    }
                 }
                 break;
             case '+':
@@ -692,8 +853,22 @@ int64_t c_tokenize_scalar(const uint8_t* source, uint64_t length, uint8_t* kinds
                 }
                 else if (c2 == '=' || c2 == ':' || c2 == '%')
                 {
+                    uint64_t size3;
+                    uint64_t size4;
+                    const int32_t c3 = peek_char(lexer, p + size2, &size3);
+                    // In C++, "<::" is '<' and "::" unless a ':' or '>' follows.
+                    if (c2 == ':' && lexer->cplusplus && c3 == ':' && peek_char(lexer, p + size2 + size3, &size4) != ':' &&
+                        peek_char(lexer, p + size2 + size3, &size4) != '>')
+                    {
+                        break;
+                    }
                     kind = c2 == '=' ? C_TOKEN_LESSEQUAL : c2 == ':' ? C_TOKEN_L_SQUARE : C_TOKEN_L_BRACE;
                     p += size2;
+                    if (c2 == '=' && lexer->cplusplus && c3 == '>')
+                    {
+                        kind = C_TOKEN_SPACESHIP;
+                        p += size3;
+                    }
                 }
                 break;
             case '>':
@@ -785,5 +960,16 @@ int64_t c_tokenize_scalar(const uint8_t* source, uint64_t length, uint8_t* kinds
         emit(&output, kind, start, p);
     }
 
-    return (int64_t)output.count;
+    return output.count;
+}
+
+int64_t c_tokenize_scalar(const uint8_t* source, uint64_t length, uint8_t* kinds, uint32_t* starts, uint32_t* ends, uint32_t flags)
+{
+    if (length > UINT32_MAX - 128)
+    {
+        return C_TOKENIZER_ERROR_FILE_TOO_BIG;
+    }
+    const uint64_t begin = length >= 3 && source[0] == 0xEF && source[1] == 0xBB && source[2] == 0xBF ? 3 : 0;
+    uint64_t resume;
+    return (int64_t)c_tokenize_scalar_range(source, length, begin, true, UINT64_MAX, kinds, starts, ends, 0, flags, &resume);
 }

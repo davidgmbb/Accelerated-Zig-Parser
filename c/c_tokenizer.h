@@ -1,11 +1,14 @@
-// A compacting AVX-512 tokenizer for C source code that hasn't been preprocessed yet: it produces the preprocessing
-// tokens of C23 translation phase 3 (after line splicing and, optionally, trigraph replacement), for a preprocessor
-// to run on afterwards. It is the 512-byte-chunk design of src/CompactingTokenizer.zig applied to C.
+// A compacting AVX-512 tokenizer for C and C++ source code that hasn't been preprocessed yet: it produces the
+// preprocessing tokens of translation phase 3 (after line splicing and, optionally, trigraph replacement), for a
+// preprocessor to run on afterwards. It is the 512-byte-chunk design of src/CompactingTokenizer.zig applied to C.
 //
-// Every kind of C source is tokenized exactly like clang's raw lexer in C23 mode (`clang -cc1 -std=c23
-// -dump-raw-tokens`), including line splices anywhere, digraphs, UCNs and UTF-8 identifiers, digit separators,
-// unterminated literals and stray characters. Common code takes the vectorized path; the rare files it can't handle
-// exactly (e.g. a line splice in the middle of a token, or a non-ASCII identifier) are tokenized by a scalar lexer.
+// Every kind of source is tokenized exactly like clang's raw lexer in C23 mode (`clang -cc1 -std=c23
+// -dump-raw-tokens`), or in C++26 mode with `C_TOKENIZER_CPLUSPLUS` (`clang -cc1 -x c++ -std=c++26
+// -dump-raw-tokens`): line splices anywhere, digraphs, UCNs and UTF-8 identifiers, digit separators, unterminated
+// literals and stray characters, and in C++ raw string literals, user-defined literal suffixes (which are part of
+// the literal's token), `<=>`, `->*`, `.*` and the `<::` rule. Common code takes the vectorized path; the rare
+// lines it can't handle exactly (e.g. a line splice in the middle of a token, a non-ASCII identifier or a raw string
+// literal) are tokenized by a scalar lexer.
 //
 // Differences from the raw lexer's output, by design:
 //   - Whitespace and comments aren't tokens. An unterminated block comment is a `C_TOKEN_UNKNOWN` token, as in clang.
@@ -26,7 +29,7 @@ extern "C" {
 
 // The kinds of preprocessing tokens. Each name is the clang token kind it matches (e.g. `C_TOKEN_STRING_LITERAL` is
 // clang's `string_literal`). The prefixed character constants and string literals follow their unprefixed kind in
-// the order L, u8, u, U.
+// the order L, u8, u, U (a raw string literal has the kind of its prefix without the R). The last three are C++'s.
 #define C_TOKEN_KINDS(X) \
     X(UNKNOWN, unknown) \
     X(RAW_IDENTIFIER, raw_identifier) \
@@ -89,7 +92,10 @@ extern "C" {
     X(EQUALEQUAL, equalequal) \
     X(COMMA, comma) \
     X(HASH, hash) \
-    X(HASHHASH, hashhash)
+    X(HASHHASH, hashhash) \
+    X(PERIODSTAR, periodstar) \
+    X(ARROWSTAR, arrowstar) \
+    X(SPACESHIP, spaceship)
 
 typedef enum CTokenKind
 {
@@ -105,9 +111,11 @@ typedef enum CTokenKind
 
 typedef enum CTokenizerFlags
 {
-    // Replace trigraphs (`??=` is `#`, ...) in translation phase 1, as C17 and earlier require. Off by default, like
-    // C23 and clang's GNU modes.
+    // Replace trigraphs (`??=` is `#`, ...) in translation phase 1, as C17 and C++14 and earlier require. Off by
+    // default, like C23, C++17 and clang's GNU modes.
     C_TOKENIZER_TRIGRAPHS = 1,
+    // Tokenize C++ (C++26) instead of C.
+    C_TOKENIZER_CPLUSPLUS = 2,
 } CTokenizerFlags;
 
 typedef enum CTokenizerError
@@ -124,12 +132,12 @@ typedef enum CTokenizerError
 // needs no padding or terminator, and `kinds`, `starts` and `ends` need `C_TOKENIZER_CAPACITY(length)` entries.
 int64_t c_tokenize(const uint8_t* source, uint64_t length, uint8_t* kinds, uint32_t* starts, uint32_t* ends, uint32_t flags);
 
-// c_tokenize without the fallback: returns C_TOKENIZER_ERROR_NEEDS_SCALAR for the rare inputs that need the scalar
-// lexer (see c_tokenizer.c), with the output arrays clobbered. For testing and benchmarking.
+// c_tokenize without the scalar lexer: returns C_TOKENIZER_ERROR_NEEDS_SCALAR for the rare inputs that need it for a
+// part (see c_tokenizer.c), with the output arrays clobbered. For testing and benchmarking.
 int64_t c_tokenize_vectorized(const uint8_t* source, uint64_t length, uint8_t* kinds, uint32_t* starts, uint32_t* ends, uint32_t flags);
 
-// The same tokenization by a straightforward scalar lexer (which `c_tokenize` falls back on for the rare inputs its
-// vectorized path doesn't handle). It writes exactly the returned number of tokens.
+// The same tokenization by a straightforward scalar lexer (which `c_tokenize` uses for the rare parts of a source
+// that its vectorized path doesn't handle). It writes exactly the returned number of tokens.
 int64_t c_tokenize_scalar(const uint8_t* source, uint64_t length, uint8_t* kinds, uint32_t* starts, uint32_t* ends, uint32_t flags);
 
 // The clang name of a token kind (without the start-of-line bit), e.g. "raw_identifier" or "plusequal".

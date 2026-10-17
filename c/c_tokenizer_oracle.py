@@ -2,9 +2,10 @@
 """Checks the C tokenizer token by token against clang's raw lexer (`clang -cc1 -std=c23 -dump-raw-tokens`).
 
 Usage: python3 c/c_tokenizer_oracle.py [--impl simd|scalar] [--clang clang] [-j N] [--show N] [--edge-cases]
-                                      [--trigraphs] [path...]
-Paths can be files or directories (searched for .c and .h files). --edge-cases adds the tricky inputs below, and
---trigraphs checks the tokenizer's trigraph option against `clang -std=c17` on inputs with trigraphs instead.
+                                      [--cplusplus] [--trigraphs] [path...]
+Paths can be files or directories (searched for .c and .h files, or with --cplusplus for C++ sources and headers,
+including extensionless ones). --cplusplus checks C++ against `clang -x c++ -std=c++26`. --edge-cases adds the
+tricky inputs below, and --trigraphs checks the trigraph option against `clang -std=c17` on inputs with trigraphs.
 Build zig-out/c_tokenizer/libc_tokenizer.so first with c/c_tokenizer_build.sh.
 
 Clang's dump is normalized to what the tokenizer emits: whitespace and comments are dropped (passing a start-of-line flag on
@@ -55,6 +56,21 @@ EDGE_CASES = [
     b"1.2.3 x.e+5 1e+e+5 .5.5 ..5 1'a 1'_ x1'2' ...5 ....5 .....5 a+++b a--->b <<= >>= <<<= %:%:%: <::> :>>\n",
     # A byte order mark, CR line endings, no newline at the end.
     b"\xef\xbb\xbfint x;\rint y;\r\n#if 1\r#endif",
+]
+
+# C++ inputs (checked with --cplusplus --edge-cases, with the C ones).
+EDGE_CASES_CPP = [
+    # User-defined literal suffixes.
+    b"\"abc\"sv \"abc\"s \"abc\"if \"abc\"_x 'a'_x 'a'x \"\"_x \"a\"PRId64 \"a\"min \"a\"d \"a\"y u8\"x\"_s \"a\"_ \"a\"__x L\"a\"s "
+    b"\"a\"il \"a\"ms \"a\"sss \"a\"i \"a\"h \"x\"_1 \"x\"1 ''_x \"x\"_a$b \"x\"s1 \"x\"sv_ 'x'sv \"x\"\\\n_y \"x\"\\u00e9 1.0_km 10ms\n",
+    # Raw string literals.
+    b"R\"(a)\" R\"d(a)d\" R\"d(a)x)d\" LR\"(a)\" u8R\"(a)\" uR\"(a)\" UR\"(a)\" xR\"(a)\" R\"(x)\"_s R\"(x)\"s R\"a b(x)a b\" z\n"
+    b"R\"(a\\\nb)\" R\"(multi\nline // not a comment /* nor this\n\"raw)\" R\"abcdefghijklmnopq(x)abcdefghijklmnopq\" y\n"
+    b"R\"$@`(x)$@`\" R\"'(x)'\" R\"x\"(z)x\"\" R\"*/(c)*/\" /* R\"( */ // R\"(\nw R\n\"(x)\" u8R \"y\" LR\"\n(x)\"\n",
+    b"R\"(unterminated\nraw",
+    # Punctuators.
+    b"a <=> b a->*b a.*b 1.*2 ...* <::x <::: <::> a<::b <:: c ^^ :: .** ->** <=>= <==> <=>> ==> :>* %>* .*. x.*=\n"
+    b"std::vector<::std::string> v; template<::T> <:\\\n:x <%::\n",
 ]
 
 # Inputs with trigraphs (checked with --trigraphs), without C23's lexical additions.
@@ -110,7 +126,8 @@ def line_offsets(data):
 
 def clang_tokens(path, data):
     """Clang's tokens for `path` as (kind, start, end, start_of_line), normalized, or None if clang fails."""
-    result = subprocess.run([options.clang, "-cc1", "-std=c17" if options.trigraphs else "-std=c23", "-dump-raw-tokens", path], capture_output=True)
+    language = ["-x", "c++", "-std=c++26"] if options.cplusplus else ["-std=c17" if options.trigraphs else "-std=c23"]
+    result = subprocess.run([options.clang, "-cc1", *language, "-dump-raw-tokens", path], capture_output=True)
     record = re.compile(rb"^([a-z0-9_]+) +'(.*?)' +Loc=<" + re.escape(path.encode()) + rb":(\d+):(\d+)>(.*)$")
     offsets = line_offsets(data)
     raw = []
@@ -144,7 +161,7 @@ def our_tokens(data):
     starts = (ctypes.c_uint32 * capacity)()
     ends = (ctypes.c_uint32 * capacity)()
     tokenize = library.c_tokenize if options.impl == "simd" else library.c_tokenize_scalar
-    count = tokenize(data, len(data), kinds, starts, ends, 1 if options.trigraphs else 0)
+    count = tokenize(data, len(data), kinds, starts, ends, (1 if options.trigraphs else 0) | (2 if options.cplusplus else 0))
     if count < 0:
         return None
     name = library.c_token_kind_name
@@ -191,6 +208,26 @@ def check(path):
     return path, "mismatch", len(expected), "\n".join(lines)
 
 
+C_EXTENSIONS = (".c", ".h")
+CPP_EXTENSIONS = (".cpp", ".cc", ".cxx", ".c++", ".hpp", ".hh", ".hxx", ".h++", ".h", ".inc", ".def", ".ipp", ".tcc", ".tpp")
+
+
+def is_source(path, cplusplus):
+    """Is `path` a C (or C++) source file? In C++, a file without an extension counts if it is text (like <vector>)."""
+    if os.path.islink(path) or not os.path.isfile(path):
+        return False
+    name = os.path.basename(path)
+    if not cplusplus:
+        return name.endswith(C_EXTENSIONS)
+    if name.endswith(CPP_EXTENSIONS):
+        return True
+    if "." in name:
+        return False
+    with open(path, "rb") as f:
+        head = f.read(4096)
+    return len(head) > 0 and b"\0" not in head
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("paths", nargs="*")
@@ -201,18 +238,20 @@ def main():
     parser.add_argument("--show", type=int, default=10, help="mismatching files to print")
     parser.add_argument("--edge-cases", action="store_true")
     parser.add_argument("--trigraphs", action="store_true")
+    parser.add_argument("--cplusplus", action="store_true")
     parsed = parser.parse_args()
 
     files = []
     for path in parsed.paths:
         if os.path.isdir(path):
             for directory, _, names in os.walk(path):
-                files.extend(os.path.join(directory, name) for name in sorted(names) if name.endswith((".c", ".h")))
+                files.extend(os.path.join(directory, name) for name in sorted(names) if is_source(os.path.join(directory, name), parsed.cplusplus))
         else:
             files.append(path)
     if parsed.edge_cases or parsed.trigraphs:
         directory = tempfile.mkdtemp(prefix="c_tokenizer_cases_")
-        for i, case in enumerate(TRIGRAPH_CASES if parsed.trigraphs else EDGE_CASES):
+        cases = TRIGRAPH_CASES if parsed.trigraphs else EDGE_CASES + (EDGE_CASES_CPP if parsed.cplusplus else [])
+        for i, case in enumerate(cases):
             files.append(os.path.join(directory, f"case_{i}.c"))
             with open(files[-1], "wb") as f:
                 f.write(case)

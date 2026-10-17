@@ -112,4 +112,34 @@ pub fn build(b: *std.Build) void {
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // `zig build c-compare -Dc-march=<cpu> -Dcorpus=<directory>` checks the C port in c/ against the Zig
+    // implementation token by token, then benchmarks both. The C port is compiled with the system's clang.
+    const c_march = b.option([]const u8, "c-march", "The -march to compile the C port with (default: native)") orelse "native";
+    const corpus = b.option([]const u8, "corpus", "The Zig files to check and benchmark the C port on (default: src/files_to_parse)") orelse "src/files_to_parse";
+    // No stack protector: the comparison program doesn't link libc, so there's no thread-local canary to read.
+    const clang = b.addSystemCommand(&.{ "clang", "-std=c11", "-O3", "-fno-stack-protector", "-Wall", "-Wextra", "-Werror" });
+    clang.addArg(b.fmt("-march={s}", .{c_march}));
+    clang.addArg("-c");
+    clang.addFileArg(b.path("c/compacting_tokenizer.c"));
+    clang.addFileInput(b.path("c/compacting_tokenizer.h"));
+    clang.addFileInput(b.path("c/compacting_tokenizer_tags.h"));
+    clang.addFileInput(b.path("c/compacting_tokenizer_tables.h"));
+    clang.addArg("-o");
+    const c_object = clang.addOutputFileArg("compacting_tokenizer.o");
+
+    const compare = b.addExecutable(.{
+        .name = "c-compare",
+        .root_source_file = b.path("c/compare.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = true,
+    });
+    compare.root_module.addImport("CompactingTokenizer", b.createModule(.{ .root_source_file = b.path("src/CompactingTokenizer.zig") }));
+    compare.addObjectFile(c_object);
+
+    const run_compare = b.addRunArtifact(compare);
+    run_compare.step.dependOn(&b.addInstallArtifact(compare, .{}).step);
+    run_compare.addArg(corpus);
+    b.step("c-compare", "Check the C port against the Zig implementation and benchmark both").dependOn(&run_compare.step);
 }
